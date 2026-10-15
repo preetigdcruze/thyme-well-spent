@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/thyme?schema=public
+  AUTH_SECRET: ci-only-secret-ci-only-secret-ci-only
+  AUTH_URL: http://localhost:3000
+  AUTH_TRUST_HOST: "true"
+  AI_PROVIDER: mock
+  RECIPE_IMPORT: mock
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  verify:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: thyme
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run lint
+      - name: Apply migrations to an empty database
+        run: npx prisma migrate deploy
+      - name: Fail if schema.prisma and migrations have drifted
+        run: npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code
+      - name: Seed catalogue and demo account
+        run: npm run db:seed
+      - name: Unit and integration tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+      - name: Upload build for browser QA
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-build
+          path: .next
+          include-hidden-files: true
+          retention-days: 1
+
+  e2e:
+    name: Browser QA walkthrough
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: thyme
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: next-build
+          path: .next
+      - run: npx prisma migrate deploy
+      - run: npm run db:seed
+      - name: Install Chromium
+        run: npx --yes playwright@1.56.1 install --with-deps chromium
+      - name: Start app
+        run: |
+          npm start > app.log 2>&1 &
+          for i in $(seq 1 60); do curl -fs http://localhost:3000/login >/dev/null && exit 0; sleep 2; done
+          echo "app did not start"; cat app.log; exit 1
+      - name: Run QA walkthrough
+        run: |
+          export CHROME_PATH="$(ls -d $HOME/.cache/ms-playwright/chromium-*/chrome-linux/chrome | head -1)"
+          node scripts/qa.mjs http://localhost:3000 qa-shots
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-screenshots
+          path: qa-shots
+          retention-days: 7
+      - name: App log on failure
+        if: failure()
+        run: tail -n 100 app.log
